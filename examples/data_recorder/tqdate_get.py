@@ -8,7 +8,7 @@ def get_rb_5min():
     """
 
     # 登录（需要天勤账号）
-    api = TqApi(auth=TqAuth("18516510818", "zhang##111"))
+    api = TqApi(auth=TqAuth("phone", "***##111"))
 
     # 主力连续合约（螺纹钢）
     klines = api.get_kline_serial("SHFE.rb000", 5 * 60)

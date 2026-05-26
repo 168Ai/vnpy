@@ -9,6 +9,7 @@ CTA策略回测示例 - 从CSV文件加载数据进行回测
 
 from datetime import datetime
 import pandas as pd
+from pathlib import Path
 
 from vnpy.trader.object import BarData
 from vnpy.trader.constant import Interval, Exchange
@@ -125,9 +126,18 @@ if __name__ == "__main__":
     # AtrRsiStrategy是基于ATR和RSI指标的CTA策略
     engine.add_strategy(AtrRsiStrategy, {})
 
-    # 从CSV文件加载历史数据
-    csv_path = "/examples/data_recorder/RB0_5min.csv"
-    bars = load_csv_data(csv_path, vt_symbol)
+    # 从CSV文件加载历史数据（使用正确的路径）
+    csv_path = Path(__file__).parent / "csv_data" / "RB0_5min.csv"
+    
+    # 检查文件是否存在
+    if not csv_path.exists():
+        print(f"错误：CSV文件不存在: {csv_path}")
+        print("请先运行 akshare_date.py 下载数据")
+        exit(1)
+    
+    print(f"正在加载数据: {csv_path}")
+    bars = load_csv_data(str(csv_path), vt_symbol)
+    print(f"成功加载 {len(bars)} 根K线")
     
     # 将加载的数据直接赋值给回测引擎的历史数据
     # 注意：这种方式会忽略set_parameters中设置的start和end参数

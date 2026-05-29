@@ -1,125 +1,7 @@
-from tqsdk import BacktestFinished, TqApi, TqAuth, TqBacktest, TqSim, tafunc
+from tqsdk import TqApi, TqAuth
 import pandas as pd
 from pathlib import Path
-from datetime import date, datetime, time, timedelta
-
-
-TQ_USER = "18516510818"
-TQ_PASSWORD = "zhang##111"
-
-
-def make_auth():
-    """创建天勤认证对象。"""
-    return TqAuth(TQ_USER, TQ_PASSWORD)
-
-
-def normalize_date_range(start_dt, end_dt):
-    """
-    将用户传入的日期范围转换成自然时间范围。
-
-    如果 end_dt 是 date 或者 00:00:00 的 datetime，按整天包含处理，
-    例如 datetime(2024, 12, 31) 会覆盖到 2024-12-31 23:59:59.999999。
-    """
-    if isinstance(start_dt, date) and not isinstance(start_dt, datetime):
-        start_dt = datetime.combine(start_dt, time.min)
-
-    if isinstance(end_dt, date) and not isinstance(end_dt, datetime):
-        end_dt = datetime.combine(end_dt, time.max)
-    elif isinstance(end_dt, datetime) and end_dt.time() == time.min:
-        end_dt = end_dt + timedelta(days=1) - timedelta(microseconds=1)
-
-    if start_dt > end_dt:
-        raise ValueError("开始时间不能晚于结束时间")
-
-    return start_dt, end_dt
-
-
-def tq_time_to_datetime(value):
-    """将 TqSdk 纳秒时间戳转换为无时区北京时间 datetime，便于写入 CSV。"""
-    if pd.isna(value) or int(value) == 0:
-        return None
-    return tafunc.time_to_datetime(int(value)).replace(tzinfo=None)
-
-
-def normalize_kline_dataframe(df, start_dt, end_dt):
-    """整理成 vn.py 回测 CSV 常用字段。"""
-    if df is None or len(df) == 0:
-        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
-
-    df = df.copy()
-    df["datetime"] = df["datetime"].map(tq_time_to_datetime)
-    df = df.dropna(subset=["datetime", "open", "high", "low", "close", "volume"])
-    df = df[(df["datetime"] >= start_dt) & (df["datetime"] <= end_dt)]
-    df = df[["datetime", "open", "high", "low", "close", "volume"]]
-    df = df.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="last")
-    return df.reset_index(drop=True)
-
-
-def fetch_kline_data_series(contract_code, period_seconds, start_dt, end_dt):
-    """
-    使用 TqSdk 专业版历史下载接口获取指定时间范围 K 线。
-
-    该接口需要账号具备 tq_dl 权限；没有权限时会抛出异常，由上层决定是否兜底。
-    """
-    api = TqApi(auth=make_auth())
-    try:
-        return api.get_kline_data_series(
-            symbol=contract_code,
-            duration_seconds=period_seconds,
-            start_dt=start_dt,
-            end_dt=end_dt,
-        )
-    finally:
-        api.close()
-
-
-def fetch_kline_by_backtest(contract_code, period_seconds, start_dt, end_dt):
-    """
-    使用回测模式按时间推进收集 K 线，作为没有专业版历史下载权限时的兜底方案。
-
-    回测模式中每根 K 线会先以开盘价生成，再在收盘时更新为完整 OHLCV；
-    因此这里用 datetime 做 key，持续覆盖同一根 K 线，最后保留完整记录。
-    """
-    api = TqApi(
-        account=TqSim(),
-        auth=make_auth(),
-        backtest=TqBacktest(start_dt=start_dt, end_dt=end_dt),
-        disable_print=True,
-    )
-    rows = {}
-
-    def collect_recent_rows(klines):
-        for _, row in klines.tail(2).iterrows():
-            dt = tq_time_to_datetime(row.get("datetime"))
-            if dt is None or not (start_dt <= dt <= end_dt):
-                continue
-            if any(pd.isna(row.get(col)) for col in ["open", "high", "low", "close", "volume"]):
-                continue
-            rows[dt] = {
-                "datetime": row["datetime"],
-                "open": row["open"],
-                "high": row["high"],
-                "low": row["low"],
-                "close": row["close"],
-                "volume": row["volume"],
-            }
-
-    try:
-        klines = api.get_kline_serial(contract_code, period_seconds, data_length=3)
-        last_report_count = 0
-
-        while True:
-            api.wait_update()
-            collect_recent_rows(klines)
-            if len(rows) - last_report_count >= 1000:
-                last_report_count = len(rows)
-                print(f"回测模式已收集 {len(rows)} 根K线...")
-    except BacktestFinished:
-        collect_recent_rows(klines)
-    finally:
-        api.close()
-
-    return pd.DataFrame(rows.values())
+from datetime import datetime
 
 
 def get_futures_minute_data_tq(symbol_code, period_minutes, start_dt, end_dt, filename):
@@ -137,37 +19,61 @@ def get_futures_minute_data_tq(symbol_code, period_minutes, start_dt, end_dt, fi
         DataFrame: K线数据
     """
     
+    print(f"正在连接天勤量化...")
+    
+    # 登录天勤（需要账号密码）
+    api = TqApi(auth=TqAuth("18516510818", "zhang##111"))
+    
     try:
-        start_dt, end_dt = normalize_date_range(start_dt, end_dt)
-        period_seconds = period_minutes * 60
-
         # 构建主力连续合约代码
         # 天勤量化格式：KQ.m@交易所.品种小写
         contract_code = f"KQ.m@{symbol_code}"
-
-        print("正在连接天勤量化...")
+        
         print(f"正在获取 {contract_code} {period_minutes}分钟K线数据...")
-        print(f"日期范围: {start_dt} 至 {end_dt}")
-
-        try:
-            print("优先使用专业版历史下载接口 get_kline_data_series...")
-            raw_df = fetch_kline_data_series(contract_code, period_seconds, start_dt, end_dt)
-        except Exception as exc:
-            msg = str(exc)
-            if "仅限专业版用户" not in msg and "tq_dl" not in msg:
-                raise
-            print(f"专业版历史下载接口不可用：{msg}")
-            print("切换到 TqBacktest 回测模式收集历史K线...")
-            raw_df = fetch_kline_by_backtest(contract_code, period_seconds, start_dt, end_dt)
-
-        print(f"原始数据条数: {len(raw_df)}")
-        df = normalize_kline_dataframe(raw_df, start_dt, end_dt)
-
-        if len(df) > 0:
-            print(f"原始时间范围: {df['datetime'].min()} 至 {df['datetime'].max()}")
-        else:
-            print("未获取到指定日期范围内的数据，不会写入空CSV。")
-            return df
+        print(f"日期范围: {start_dt.strftime('%Y-%m-%d')} 至 {end_dt.strftime('%Y-%m-%d')}")
+        
+        # 使用 query_history 获取历史数据
+        print("正在查询历史数据...")
+        
+        # 查询历史K线
+        klines = api.query_history(
+            symbol=contract_code,
+            duration_seconds=period_minutes * 60,
+            start_datetime=start_dt,
+            end_datetime=end_dt
+        )
+        
+        print(f"成功获取数据，原始数据条数: {len(klines)}")
+        
+        if len(klines) == 0:
+            print("未获取到数据，请检查合约代码和日期范围是否正确")
+            return None
+        
+        # 转换为 DataFrame
+        df = pd.DataFrame(klines)
+        
+        # 时间戳转换（已经是北京时间）
+        df["datetime"] = pd.to_datetime(df["datetime"], unit="s")
+        
+        print(f"时间范围: {df['datetime'].min()} 至 {df['datetime'].max()}")
+        
+        # 统一字段（符合 vn.py 格式）
+        df = df.rename(columns={
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume"
+        })
+        
+        # 选择需要的列
+        df = df[["datetime", "open", "high", "low", "close", "volume"]]
+        
+        # 去除空值
+        df = df.dropna()
+        
+        # 排序
+        df = df.sort_values("datetime").reset_index(drop=True)
         
         print(f"\n处理后数据条数: {len(df)}")
         print("数据预览：")
@@ -193,7 +99,8 @@ def get_futures_minute_data_tq(symbol_code, period_minutes, start_dt, end_dt, fi
         return None
         
     finally:
-        pass
+        # 关闭API连接
+        api.close()
 
 
 def get_active_contracts_tq():

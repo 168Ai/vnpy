@@ -33,7 +33,7 @@ class BottomReversalStrategy(CtaTemplate):
     
     # 策略参数
     drop_count = 30              # 观察下跌的K线数量窗口
-    drop_threshold = 0.005       # 总体跌幅阈值（0.5%）
+    drop_threshold = 0.01       # 总体跌幅阈值（1%）
     ma_length = 20              # 均线周期
     macd_fast = 12              # MACD快线周期
     macd_slow = 26              # MACD慢线周期

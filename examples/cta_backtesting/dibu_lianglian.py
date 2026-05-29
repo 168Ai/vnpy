@@ -342,6 +342,6 @@ def run_backtesting(source_df: pd.DataFrame) -> None:
 
 
 if __name__ == "__main__":
-    csv_path = Path(__file__).resolve().parents[1] / "data_recorder" / "RB0_5min.csv"
+    csv_path = Path(__file__).resolve().parents[1] / "cta_backtesting/csv_data/" / "RB0_5min.csv"
     source_data = load_csv_data(csv_path, "RB0.SHFE")
     run_backtesting(source_data)

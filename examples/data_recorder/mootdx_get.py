@@ -4,6 +4,7 @@ import argparse
 import csv
 import re
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -189,6 +190,27 @@ def normalize_exchange(exchange: str | None) -> str | None:
             return standard
 
     raise ValueError(f"不支持的交易所：{exchange}")
+
+
+def normalize_datetime_range(start_dt=None, end_dt=None):
+    """Parse and normalize optional datetime range values."""
+    if start_dt is not None:
+        start_dt = pd.to_datetime(start_dt).to_pydatetime()
+    if end_dt is not None:
+        end_dt = pd.to_datetime(end_dt).to_pydatetime()
+
+    if isinstance(start_dt, date) and not isinstance(start_dt, datetime):
+        start_dt = datetime.combine(start_dt, time.min)
+
+    if isinstance(end_dt, date) and not isinstance(end_dt, datetime):
+        end_dt = datetime.combine(end_dt, time.max)
+    elif isinstance(end_dt, datetime) and end_dt.time() == time.min:
+        end_dt = end_dt + timedelta(days=1) - timedelta(microseconds=1)
+
+    if start_dt and end_dt and start_dt > end_dt:
+        raise ValueError("开始时间不能晚于结束时间")
+
+    return start_dt, end_dt
 
 
 def product_from_symbol(symbol: str) -> str:
@@ -491,10 +513,13 @@ def fetch_bars(
     frequency: str | int = "5m",
     offset: int = 800,
     pages: int = 1,
+    start_dt=None,
+    end_dt=None,
 ) -> pd.DataFrame:
     category = normalize_frequency(frequency)
     offset = max(1, min(int(offset), 800))
     pages = max(1, int(pages))
+    start_dt, end_dt = normalize_datetime_range(start_dt, end_dt)
 
     frames = []
     for page in range(pages):
@@ -518,7 +543,7 @@ def fetch_bars(
         return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume", "hold", "settlement"])
 
     raw = pd.concat(frames, ignore_index=True)
-    return normalize_bars(raw)
+    return filter_bars_by_datetime(normalize_bars(raw), start_dt=start_dt, end_dt=end_dt)
 
 
 def normalize_bars(raw: pd.DataFrame) -> pd.DataFrame:
@@ -535,6 +560,17 @@ def normalize_bars(raw: pd.DataFrame) -> pd.DataFrame:
     df = df[["datetime", "open", "high", "low", "close", "volume", "hold", "settlement"]]
     df = df.sort_values("datetime")
     df = df.drop_duplicates(subset=["datetime"], keep="last")
+    return df.reset_index(drop=True)
+
+
+def filter_bars_by_datetime(df: pd.DataFrame, start_dt=None, end_dt=None) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    if start_dt is not None:
+        df = df[df["datetime"] >= start_dt]
+    if end_dt is not None:
+        df = df[df["datetime"] <= end_dt]
     return df.reset_index(drop=True)
 
 
@@ -560,6 +596,8 @@ def get_futures_kline(
     filename: str | None = None,
     offset: int = 800,
     pages: int = 1,
+    start_dt=None,
+    end_dt=None,
     timeout: float = 5,
     server: str | None = None,
     refresh_instruments: bool = False,
@@ -573,6 +611,10 @@ def get_futures_kline(
         python mootdx_get.py --search RB
     frequency:
         1m/5m/15m/30m/1h/day/week/month，也可传 1/5/15/30/60。
+    start_dt/end_dt:
+        可选时间范围，例如 "2026-05-29 09:00"、"2026-05-29"。
+        通达信扩展行情按最近K线分页返回，所以需要把 pages 设得足够大，
+        脚本会在拉取后再按时间过滤。
     exchange:
         可选 shfe/ine/dce/czce/cffex/gfex。未传时按品种自动猜测。
     """
@@ -589,7 +631,17 @@ def get_futures_kline(
             f"匹配合约：market={contract.market}, code={contract.code}, "
             f"name={contract.name}, desc={contract.desc}"
         )
-        df = fetch_bars(client, contract, frequency=frequency, offset=offset, pages=pages)
+        df = fetch_bars(
+            client,
+            contract,
+            frequency=frequency,
+            offset=offset,
+            pages=pages,
+            start_dt=start_dt,
+            end_dt=end_dt,
+        )
+        if df.empty and (start_dt is not None or end_dt is not None):
+            print("指定时间范围内没有数据；请增大 --pages，或确认该通达信源是否覆盖该时间段。")
         if not df.empty:
             print(f"数据范围：{df['datetime'].min()} 至 {df['datetime'].max()}，共 {len(df)} 根")
             print(df.head())
@@ -636,6 +688,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frequency", default="5m", help="周期：1m/5m/15m/30m/1h/day/week/month")
     parser.add_argument("--offset", type=int, default=800, help="每页K线数量，最大800")
     parser.add_argument("--pages", type=int, default=1, help="向前翻页次数，每页最多800根")
+    parser.add_argument("--start", help="开始时间，如 2026-05-29 或 '2026-05-29 09:00'")
+    parser.add_argument("--end", help="结束时间，如 2026-05-29 或 '2026-05-29 15:00'")
     parser.add_argument("--filename", help="输出CSV文件名，默认 symbol_frequency.csv")
     parser.add_argument("--timeout", type=float, default=5, help="服务器连接超时秒数")
     parser.add_argument("--server", help="自定义扩展行情服务器 ip:port，多个用逗号分隔")
@@ -670,6 +724,8 @@ def main() -> None:
         filename=args.filename,
         offset=args.offset,
         pages=args.pages,
+        start_dt=args.start,
+        end_dt=args.end,
         timeout=args.timeout,
         server=args.server,
         refresh_instruments=args.refresh_instruments,

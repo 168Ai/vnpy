@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,15 @@ FREQUENCY_MAP = {
     "mon": 6,
     "1m": 7,
     "1min": 7,
+}
+
+FUTURE_MARKET_IDS = {
+    "czce": [28],
+    "dce": [29],
+    "shfe": [30],
+    "cffex": [47],
+    "main": [60],
+    "gfex": [66, 65],
 }
 
 EXCHANGE_ALIASES = {
@@ -319,7 +329,34 @@ def market_ids_for_exchange(markets: pd.DataFrame, exchange: str | None) -> list
         return []
 
     matched = markets[markets["exchange"] == exchange]
-    return sorted({int(value) for value in matched["market"].tolist()})
+    ids = {int(value) for value in matched["market"].tolist()}
+    ids.update(FUTURE_MARKET_IDS.get(exchange, []))
+    return sorted(ids)
+
+
+def likely_market_ids(symbol: str, exchange: str | None) -> list[int]:
+    ids = []
+    if exchange:
+        ids.extend(FUTURE_MARKET_IDS.get(exchange, []))
+
+    if symbol_is_main(symbol):
+        ids.extend(FUTURE_MARKET_IDS["main"])
+
+    for market_ids in FUTURE_MARKET_IDS.values():
+        ids.extend(market_ids)
+
+    unique = []
+    for item in ids:
+        if item not in unique:
+            unique.append(item)
+    return unique
+
+
+def symbol_is_main(symbol: str) -> bool:
+    compact = symbol.strip().replace(".", "").replace("-", "").replace("_", "")
+    product = product_from_symbol(compact)
+    suffix = compact[len(product) :].upper()
+    return bool(product and suffix in {"0", "00", "L0", "L8"})
 
 
 def fetch_instruments(
@@ -345,7 +382,7 @@ def fetch_instruments(
 
     if cache_file:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache_file, index=False)
+        df.to_csv(cache_file, index=False, quoting=csv.QUOTE_MINIMAL, escapechar="\\")
         print(f"合约表已缓存：{cache_file}")
 
     return df
@@ -379,11 +416,16 @@ def search_contracts(
 def resolve_contract(
     client: TdxExHq_API,
     symbol: str,
+    frequency: str | int = "5m",
     exchange: str | None = None,
     refresh_instruments: bool = False,
 ) -> Contract:
     markets = fetch_markets(client)
     exchange = normalize_exchange(exchange) or guess_exchange(symbol)
+    direct = resolve_contract_direct(client, symbol=symbol, frequency=frequency, exchange=exchange)
+    if direct:
+        return direct
+
     cache_file = output_dir() / "mootdx_instruments.csv"
     instruments = fetch_instruments(client, cache_file=cache_file, refresh=refresh_instruments)
 
@@ -420,6 +462,29 @@ def resolve_contract(
     raise LookupError(f"没有在通达信扩展行情合约表中找到：{symbol}")
 
 
+def resolve_contract_direct(
+    client: TdxExHq_API,
+    symbol: str,
+    frequency: str | int = "5m",
+    exchange: str | None = None,
+) -> Contract | None:
+    candidates = normalize_symbol_candidates(symbol)
+    markets = likely_market_ids(symbol, exchange)
+    category = normalize_frequency(frequency)
+
+    for code in candidates:
+        for market in markets:
+            try:
+                bars = client.get_instrument_bars(category, market, code, 0, 1)
+                if not bars:
+                    continue
+                return Contract(market=market, code=code)
+            except Exception:
+                continue
+
+    return None
+
+
 def fetch_bars(
     client: TdxExHq_API,
     contract: Contract,
@@ -450,7 +515,7 @@ def fetch_bars(
             break
 
     if not frames:
-        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume", "hold", "amount"])
+        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume", "hold", "settlement"])
 
     raw = pd.concat(frames, ignore_index=True)
     return normalize_bars(raw)
@@ -461,13 +526,13 @@ def normalize_bars(raw: pd.DataFrame) -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["volume"] = pd.to_numeric(df.get("trade", 0), errors="coerce").fillna(0)
     df["hold"] = pd.to_numeric(df.get("position", 0), errors="coerce").fillna(0)
-    df["amount"] = pd.to_numeric(df.get("amount", df.get("price", 0)), errors="coerce").fillna(0)
+    df["settlement"] = pd.to_numeric(df.get("price", 0), errors="coerce").fillna(0)
 
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
-    df = df[["datetime", "open", "high", "low", "close", "volume", "hold", "amount"]]
+    df = df[["datetime", "open", "high", "low", "close", "volume", "hold", "settlement"]]
     df = df.sort_values("datetime")
     df = df.drop_duplicates(subset=["datetime"], keep="last")
     return df.reset_index(drop=True)
@@ -513,7 +578,13 @@ def get_futures_kline(
     """
     client = connect_ext(timeout=timeout, server=server)
     try:
-        contract = resolve_contract(client, symbol, exchange=exchange, refresh_instruments=refresh_instruments)
+        contract = resolve_contract(
+            client,
+            symbol,
+            frequency=frequency,
+            exchange=exchange,
+            refresh_instruments=refresh_instruments,
+        )
         print(
             f"匹配合约：market={contract.market}, code={contract.code}, "
             f"name={contract.name}, desc={contract.desc}"
